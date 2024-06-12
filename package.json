@@ -1,0 +1,70 @@
+{
+  "name": "vscode-vibe",
+  "displayName": "Vibe",
+  "description": "",
+  "publisher": "tyler",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onUri"
+  ],
+  "enabledApiProposals": [
+    "lmTools"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscode-vibe.helloWorld",
+        "title": "Hello World"
+      },
+      {
+        "command": "vscode-vibe.play-songs",
+        "title": "Play Songs"
+      }
+    ],
+    "authentication": [
+      {
+        "id": "spotify",
+        "label": "Spotify"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "vibe",
+        "fullName": "Spotify Vibe",
+        "commands": [],
+        "description": "Spotify Vibe",
+        "name": "vibe",
+        "sampleRequest": "give me some lofi to focus to"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "18.x",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.1",
+    "@typescript-eslint/parser": "^6.13.1",
+    "@vscode/test-cli": "^0.0.4",
+    "@vscode/test-electron": "^2.3.8",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "@spotify/web-api-ts-sdk": "^1.2.0"
+  }
+}

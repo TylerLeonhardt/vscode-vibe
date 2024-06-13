@@ -38,6 +38,8 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		this._disposables.add(this._onDidChangeSessions);
 	}
 
+	//#region Lifecycle functions
+
 	dispose() {
 		for (const disposable of this._disposables) {
 			try {
@@ -51,8 +53,12 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 	async initialize() {
 		let sessions = await this._secretStorage.get(secretStorageKey);
 		this._sessions = sessions ? JSON.parse(sessions) : [];
-		await this.refreshSessions();
+		await this._refreshSessions();
 	}
+
+	//#endregion
+
+	//#region AuthenticationProvider implementation
 
 	getSessions(scopes?: readonly string[]): Thenable<readonly AuthenticationSession[]> {
 		return Promise.resolve(this._sessions
@@ -68,15 +74,15 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 
 	async createSession(scopes: readonly string[]): Promise<AuthenticationSession> {
 		const codeVerifier = this._createCodeVerifier();
-		const codeChallenge = await this.createCodeChallenge(codeVerifier);
-		await this.openSpotifyAuthUri(scopes.join(' '), codeChallenge);
+		const codeChallenge = await this._createCodeChallenge(codeVerifier);
+		await this._openSpotifyAuthUri(scopes.join(' '), codeChallenge);
 		const uri = await this._uriHandler.waitForUri();
 		const code = new URLSearchParams(uri.query).get('code');
 		if (!code) {
 			throw new Error('No code found in URI');
 		}
-		const response = await this.exchangeCodeForToken(code, codeVerifier);
-		const { display_name, id } = await this.getUserInfo(response.access_token);
+		const response = await this._exchangeCodeForToken(code, codeVerifier);
+		const { display_name, id } = await this._getUserInfo(response.access_token);
 		const session: UpdateableAuthenticationSession = {
 			id: response.access_token,
 			accessToken: response.access_token,
@@ -93,7 +99,7 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		this._onDidChangeSessions.fire({ added: [session], removed: [], changed: [] });
 		// Setup the timeout to refresh the sessions
 		if (this._sessions.length === 1) {
-			setTimeout(() => this.refreshSessions(), response.expires_in * 1000 * 2/3);
+			setTimeout(() => this._refreshSessions(), response.expires_in * 1000 * 2/3);
 		}
 		return {
 			id: session.id,
@@ -113,6 +119,10 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return Promise.resolve();
 	}
 
+	//#endregion
+
+	//#region Spotify-specific functions
+
 	async getSpotifyClient(scopes: string[] = defaultScopes) {
 		let auth = this._sessions.find(session => scopes.every(scope => session.scopes.includes(scope)));
 		if (!auth) {
@@ -131,6 +141,10 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return client;
 	}
 
+	//#endregion
+
+	//#region create flow helpers
+
 	private _createCodeVerifier(): string {
 		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 		const randomValues = crypto.getRandomValues(new Uint8Array(64));
@@ -138,7 +152,7 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return randomString;
 	}
 
-	private async createCodeChallenge(codeVerifier: string): Promise<string> {
+	private async _createCodeChallenge(codeVerifier: string): Promise<string> {
 		const data = new TextEncoder().encode(codeVerifier);
 		const hashed = await crypto.subtle.digest('SHA-256', data);
 
@@ -149,7 +163,7 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return code_challenge_base64;
 	}
 
-	private async openSpotifyAuthUri(
+	private async _openSpotifyAuthUri(
 		scope: string,
 		codeChallenge: string
 	): Promise<boolean> {
@@ -167,7 +181,7 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return await env.openExternal(Uri.parse(authUrl.toString()));
 	}
 
-	private async exchangeCodeForToken(code: string, codeVerifier: string): Promise<AccessToken> {
+	private async _exchangeCodeForToken(code: string, codeVerifier: string): Promise<AccessToken> {
 		const body = new URLSearchParams({
 			grant_type: 'authorization_code',
 			code,
@@ -183,29 +197,43 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return response;
 	}
 
-	private async refreshSessions(): Promise<void> {
+	private async _getUserInfo(accessToken: string): Promise<{ display_name: string, id: string }> {
+		const response = await this._safeFetchWithRetry<{ display_name: string, id: string }>(
+			'https://api.spotify.com/v1/me',
+			{
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}
+		);
+		return response;
+	}
+
+	//#endregion
+
+	//#region refresh flow helpers
+
+	private async _refreshSessions(): Promise<void> {
 		if (!this._sessions.length) {
 			return;
 		}
 		for (const session of this._sessions) {
 			try {
-				const newSession = await this.refreshSession(session.refreshToken);
+				const newSession = await this._refreshSession(session.refreshToken);
 				session.accessToken = newSession.access_token;
 				session.refreshToken = newSession.refresh_token;
 				session.expiresIn = newSession.expires_in;
 			} catch (e: any) {
 				if (e.message === 'Network failure') {
-					setTimeout(() => this.refreshSessions(), 60 * 1000);
+					setTimeout(() => this._refreshSessions(), 60 * 1000);
 					return;
 				}
 			}
 		}
 		await this._secretStorage.store(secretStorageKey, JSON.stringify(this._sessions));
 		this._onDidChangeSessions.fire({ added: [], removed: [], changed: this._sessions });
-		setTimeout(() => this.refreshSessions(), this._sessions[0].expiresIn * 1000 * 2/3);
+		setTimeout(() => this._refreshSessions(), this._sessions[0].expiresIn * 1000 * 2/3);
 	}
 
-	private async refreshSession(refreshToken: string): Promise<AccessToken> {
+	private async _refreshSession(refreshToken: string): Promise<AccessToken> {
 		const body = new URLSearchParams({
 			grant_type: 'refresh_token',
 			refresh_token: refreshToken,
@@ -219,15 +247,9 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 		return response;
 	}
 
-	private async getUserInfo(accessToken: string): Promise<{ display_name: string, id: string }> {
-		const response = await this._safeFetchWithRetry<{ display_name: string, id: string }>(
-			'https://api.spotify.com/v1/me',
-			{
-				headers: { Authorization: `Bearer ${accessToken}` },
-			}
-		);
-		return response;
-	}
+	//#endregion
+
+	//#region network helpers
 
 	private async _safeFetchWithRetry<T>(request: string | URL | Request, init?: RequestInit): Promise<T> {
 		let retryCount = 0;
@@ -284,6 +306,8 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 			throw new NetworkError();
 		}
 	}
+
+	//#endregion
 }
 
 class NetworkError extends Error {

@@ -1,8 +1,7 @@
-import { authentication, AuthenticationProvider, AuthenticationProviderAuthenticationSessionsChangeEvent, AuthenticationSession, env, Event, EventEmitter, Uri } from "vscode";
+import { authentication, AuthenticationProvider, AuthenticationProviderAuthenticationSessionsChangeEvent, AuthenticationSession, Disposable, env, Event, EventEmitter, SecretStorage, Uri, window } from "vscode";
 import { SpotifyUriHandler } from "./uriHandler";
 import * as crypto from 'crypto';
 import { AccessToken, SpotifyApi } from "@spotify/web-api-ts-sdk";
-import { BetterTokenStorage } from "./betterSecretStorage";
 
 const clientId = '18f4898a018949518ac1b17eea561af9';
 const redirectUrl = 'https://vscode.dev/redirect';
@@ -12,179 +11,289 @@ export const defaultScopes = ['user-read-private', 'user-read-email', 'user-read
 const authorizationEndpoint = "https://accounts.spotify.com/authorize";
 const tokenEndpoint = "https://accounts.spotify.com/api/token";
 
+const secretStorageKey = 'tokens';
+
 export interface UpdateableAuthenticationSession extends AuthenticationSession {
-    accessToken: string;
-    refreshToken: string;
-    expiresIn: number;
+	accessToken: string;
+	refreshToken: string;
+	expiresIn: number;
 }
 
-export class SpotifyAuthProvider implements AuthenticationProvider {
-    static readonly id = 'spotify';
-    static readonly label = 'Spotify';
-    
-    private _onDidChangeSessions: EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent> = new EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent>();
-    onDidChangeSessions: Event<AuthenticationProviderAuthenticationSessionsChangeEvent> = this._onDidChangeSessions.event;
+export class SpotifyAuthProvider extends Disposable implements AuthenticationProvider {
+	static readonly id = 'spotify';
+	static readonly label = 'Spotify';
 
-    // TODO: Save these sessions to disk
-    private _sessions: UpdateableAuthenticationSession[] = [];
-    // private _sessions2: Promise<UpdateableAuthenticationSession[]>;
+	private _disposables = new Set<Disposable>();
 
-    constructor(private readonly _uriHandler: SpotifyUriHandler, private readonly _tokenStorage: BetterTokenStorage<UpdateableAuthenticationSession>) {
-        // this_sessions2 = _tokenStorage.getAll();
-    }
+	private _onDidChangeSessions: EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent> = new EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent>();
+	onDidChangeSessions: Event<AuthenticationProviderAuthenticationSessionsChangeEvent> = this._onDidChangeSessions.event;
 
-    getSessions(scopes?: readonly string[]): Thenable<readonly AuthenticationSession[]> {
-        return Promise.resolve(this._sessions
-            .filter(session => !scopes || scopes.every(scope => session.scopes.includes(scope)))
-            .map(s => ({
-                id: s.id,
-                accessToken: s.accessToken,
-                scopes: s.scopes,
-                account: s.account
-            }))
-        );
-    }
+	// TODO: Save these sessions to disk
+	private _sessions: UpdateableAuthenticationSession[] = [];
 
-    async createSession(scopes: readonly string[]): Promise<AuthenticationSession> {
-        const codeVerifier = this._createCodeVerifier();
-        const codeChallenge = await this.createCodeChallenge(codeVerifier);
-        await this.openSpotifyAuthUri(scopes.join(' '), codeChallenge);
-        const uri = await this._uriHandler.waitForUri();
-        const code = new URLSearchParams(uri.query).get('code');
-        if (!code) {
-            throw new Error('No code found in URI');
-        }
-        const response = await this.exchangeCodeForToken(code, codeVerifier);
-        const { display_name, id } = await this.getUserInfo(response.access_token);
-        const session: UpdateableAuthenticationSession = {
-            id: response.access_token,
-            accessToken: response.access_token,
-            refreshToken: response.refresh_token,
-            expiresIn: response.expires_in,
-            scopes,
-            account: {
-                label: display_name,
-                id
-            }
-        };
-        this._sessions.push(session);
-        this._onDidChangeSessions.fire({ added: [session], removed: [], changed: [] });
-        setTimeout(() => this.refreshTokens(), response.expires_in * 1000 * 2/3);
-        return {
-            id: session.id,
-            accessToken: session.accessToken,
-            scopes: session.scopes,
-            account: session.account
-        };
-    }
+	constructor(
+		private readonly _uriHandler: SpotifyUriHandler,
+		private readonly _secretStorage: SecretStorage
+	) {
+		super(() => this.dispose());
+	}
 
-    removeSession(sessionId: string): Thenable<void> {
-        const sessionIndex = this._sessions.findIndex(session => session.id === sessionId);
-        if (sessionIndex !== -1) {
-            const [session] = this._sessions.splice(sessionIndex, 1);
-            this._onDidChangeSessions.fire({ added: [], removed: [session], changed: [] });
-        }
-        return Promise.resolve();
-    }
+	dispose() {
+		for (const disposable of this._disposables) {
+			try {
+				disposable.dispose();
+			} catch (e) {
+				console.error(e);
+			}
+		}
+	}
 
-    async getSpotifyClient(scopes: string[] = defaultScopes) {
-        let auth = this._sessions.find(session => scopes.every(scope => session.scopes.includes(scope)));
-        if (!auth) {
-            await authentication.getSession(SpotifyAuthProvider.id, scopes, { createIfNone: true });
-            auth = this._sessions.find(session => scopes.every(scope => session.scopes.includes(scope)));
-            if (!auth) {
-                throw new Error('Failed to get Spotify client');
-            }
-        }
-        const client = SpotifyApi.withAccessToken(clientId, {
-            access_token: auth.accessToken,
-            expires_in: auth.expiresIn,
-            refresh_token: auth.refreshToken,
-            token_type: 'Bearer',
-        });
-        return client;
-    }
+	async initialize() {
+		let sessions = await this._secretStorage.get(secretStorageKey);
+		this._sessions = sessions ? JSON.parse(sessions) : [];
+		await this.refreshSessions();
+	}
 
-    private _createCodeVerifier(): string {
-        const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        const randomValues = crypto.getRandomValues(new Uint8Array(64));
-        const randomString = randomValues.reduce((acc, x) => acc + possible[x % possible.length], "");
-        return randomString;
-    }
+	getSessions(scopes?: readonly string[]): Thenable<readonly AuthenticationSession[]> {
+		return Promise.resolve(this._sessions
+			.filter(session => !scopes || scopes.every(scope => session.scopes.includes(scope)))
+			.map(s => ({
+				id: s.id,
+				accessToken: s.accessToken,
+				scopes: s.scopes,
+				account: s.account
+			}))
+		);
+	}
 
-    private async createCodeChallenge(codeVerifier: string): Promise<string> {
-        const data = new TextEncoder().encode(codeVerifier);
-        const hashed = await crypto.subtle.digest('SHA-256', data);
+	async createSession(scopes: readonly string[]): Promise<AuthenticationSession> {
+		const codeVerifier = this._createCodeVerifier();
+		const codeChallenge = await this.createCodeChallenge(codeVerifier);
+		await this.openSpotifyAuthUri(scopes.join(' '), codeChallenge);
+		const uri = await this._uriHandler.waitForUri();
+		const code = new URLSearchParams(uri.query).get('code');
+		if (!code) {
+			throw new Error('No code found in URI');
+		}
+		const response = await this.exchangeCodeForToken(code, codeVerifier);
+		const { display_name, id } = await this.getUserInfo(response.access_token);
+		const session: UpdateableAuthenticationSession = {
+			id: response.access_token,
+			accessToken: response.access_token,
+			refreshToken: response.refresh_token,
+			expiresIn: response.expires_in,
+			scopes,
+			account: {
+				label: display_name,
+				id
+			}
+		};
+		this._sessions.push(session);
+		await this._secretStorage.store(secretStorageKey, JSON.stringify(this._sessions));
+		this._onDidChangeSessions.fire({ added: [session], removed: [], changed: [] });
+		// Setup the timeout to refresh the sessions
+		if (this._sessions.length === 1) {
+			setTimeout(() => this.refreshSessions(), response.expires_in * 1000 * 2/3);
+		}
+		return {
+			id: session.id,
+			accessToken: session.accessToken,
+			scopes: session.scopes,
+			account: session.account
+		};
+	}
 
-        const code_challenge_base64 = btoa(String.fromCharCode(...new Uint8Array(hashed)))
-            .replace(/=/g, '')
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_');
-        return code_challenge_base64;
-    }
+	async removeSession(sessionId: string): Promise<void> {
+		const sessionIndex = this._sessions.findIndex(session => session.id === sessionId);
+		if (sessionIndex !== -1) {
+			const [session] = this._sessions.splice(sessionIndex, 1);
+			await this._secretStorage.store(secretStorageKey, JSON.stringify(this._sessions));
+			this._onDidChangeSessions.fire({ added: [], removed: [session], changed: [] });
+		}
+		return Promise.resolve();
+	}
 
-    private async openSpotifyAuthUri(
-        scope: string,
-        codeChallenge: string
-    ): Promise<boolean> {
-        const redirectTo = await env.asExternalUri(Uri.parse(`${env.uriScheme}://tyler.vscode-vibe/authenticate`));
-        const authUrl = new URL(authorizationEndpoint);
-        authUrl.search = new URLSearchParams({
-            response_type: 'code',
-            client_id: clientId,
-            scope: scope,
-            code_challenge_method: 'S256',
-            code_challenge: codeChallenge,
-            state: redirectTo.toString(true),
-            redirect_uri: redirectUrl,
-        }).toString();
-        return await env.openExternal(Uri.parse(authUrl.toString()));
-    }
+	async getSpotifyClient(scopes: string[] = defaultScopes) {
+		let auth = this._sessions.find(session => scopes.every(scope => session.scopes.includes(scope)));
+		if (!auth) {
+			await authentication.getSession(SpotifyAuthProvider.id, scopes, { createIfNone: true });
+			auth = this._sessions.find(session => scopes.every(scope => session.scopes.includes(scope)));
+			if (!auth) {
+				throw new Error('Failed to get Spotify client');
+			}
+		}
+		const client = SpotifyApi.withAccessToken(clientId, {
+			access_token: auth.accessToken,
+			expires_in: auth.expiresIn,
+			refresh_token: auth.refreshToken,
+			token_type: 'Bearer',
+		});
+		return client;
+	}
 
-    private async exchangeCodeForToken(code: string, codeVerifier: string): Promise<AccessToken> {
-        const body = new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            redirect_uri: redirectUrl,
-            client_id: clientId,
-            code_verifier: codeVerifier,
-        }).toString();
-        const response = await fetch(tokenEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body,
-        });
-        const json = await response.json() as any;
-        return json;
-    }
+	private _createCodeVerifier(): string {
+		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+		const randomValues = crypto.getRandomValues(new Uint8Array(64));
+		const randomString = randomValues.reduce((acc, x) => acc + possible[x % possible.length], "");
+		return randomString;
+	}
 
-    private async refreshTokens(): Promise<void> {
-        for (const session of this._sessions) {
-            const newAccessToken = await this.refreshAccessToken(session.refreshToken);
-            session.accessToken = newAccessToken;
-        }
-        setTimeout(() => this.refreshTokens(), this._sessions[0].expiresIn * 1000 * 2/3);
-    }
+	private async createCodeChallenge(codeVerifier: string): Promise<string> {
+		const data = new TextEncoder().encode(codeVerifier);
+		const hashed = await crypto.subtle.digest('SHA-256', data);
 
-    private async refreshAccessToken(refreshToken: string): Promise<string> {
-        const body = new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken,
-            client_id: clientId,
-        }).toString();
-        const response = await fetch(tokenEndpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body,
-        });
-        const json = await response.json() as any;
-        return json.access_token;
-    }
+		const code_challenge_base64 = btoa(String.fromCharCode(...new Uint8Array(hashed)))
+			.replace(/=/g, '')
+			.replace(/\+/g, '-')
+			.replace(/\//g, '_');
+		return code_challenge_base64;
+	}
 
-    private async getUserInfo(accessToken: string): Promise<{ display_name: string, id: string }> {
-        const response = await fetch('https://api.spotify.com/v1/me', {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        });
-        return await response.json() as any;
-    }
+	private async openSpotifyAuthUri(
+		scope: string,
+		codeChallenge: string
+	): Promise<boolean> {
+		const redirectTo = await env.asExternalUri(Uri.parse(`${env.uriScheme}://tyler.vscode-vibe/authenticate`));
+		const authUrl = new URL(authorizationEndpoint);
+		authUrl.search = new URLSearchParams({
+			response_type: 'code',
+			client_id: clientId,
+			scope: scope,
+			code_challenge_method: 'S256',
+			code_challenge: codeChallenge,
+			state: redirectTo.toString(true),
+			redirect_uri: redirectUrl,
+		}).toString();
+		return await env.openExternal(Uri.parse(authUrl.toString()));
+	}
+
+	private async exchangeCodeForToken(code: string, codeVerifier: string): Promise<AccessToken> {
+		const body = new URLSearchParams({
+			grant_type: 'authorization_code',
+			code,
+			redirect_uri: redirectUrl,
+			client_id: clientId,
+			code_verifier: codeVerifier,
+		}).toString();
+		const response = await this._safeFetchWithRetry<AccessToken>(tokenEndpoint, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body,
+		});
+		return response;
+	}
+
+	private async refreshSessions(): Promise<void> {
+		if (!this._sessions.length) {
+			return;
+		}
+		for (const session of this._sessions) {
+			try {
+				const newSession = await this.refreshSession(session.refreshToken);
+				session.accessToken = newSession.access_token;
+				session.refreshToken = newSession.refresh_token;
+				session.expiresIn = newSession.expires_in;
+			} catch (e: any) {
+				if (e.message === 'Network failure') {
+					setTimeout(() => this.refreshSessions(), 60 * 1000);
+					return;
+				}
+			}
+		}
+		await this._secretStorage.store(secretStorageKey, JSON.stringify(this._sessions));
+		this._onDidChangeSessions.fire({ added: [], removed: [], changed: this._sessions });
+		setTimeout(() => this.refreshSessions(), this._sessions[0].expiresIn * 1000 * 2/3);
+	}
+
+	private async refreshSession(refreshToken: string): Promise<AccessToken> {
+		const body = new URLSearchParams({
+			grant_type: 'refresh_token',
+			refresh_token: refreshToken,
+			client_id: clientId,
+		}).toString();
+		const response = await this._safeFetchWithRetry<AccessToken>(tokenEndpoint, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body,
+		});
+		return response;
+	}
+
+	private async getUserInfo(accessToken: string): Promise<{ display_name: string, id: string }> {
+		const response = await this._safeFetchWithRetry<{ display_name: string, id: string }>(
+			'https://api.spotify.com/v1/me',
+			{
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}
+		);
+		return response;
+	}
+
+	private async _safeFetchWithRetry<T>(request: string | URL | Request, init?: RequestInit): Promise<T> {
+		let retryCount = 0;
+		const maxRetries = 3;
+		const baseDelay = 1000;
+		try {
+			const response = await this._safeFetch(request, init);
+			return response;
+		} catch (error) {
+			if (error instanceof NetworkError) {
+				while (retryCount < maxRetries) {
+					const delay = baseDelay * Math.pow(2, retryCount);
+					await new Promise(resolve => setTimeout(resolve, delay));
+					try {
+						const response = await this._safeFetch(request, init);
+						return response;
+					} catch (error) {
+						if (error instanceof NetworkError) {
+							retryCount++;
+						} else {
+							throw error;
+						}
+					}
+				}
+				throw new NetworkError();
+			} else {
+				throw error;
+			}
+		}
+	}
+
+	private async _safeFetch(request: string | URL | Request, init?: RequestInit): Promise<any> {
+		let response: Response;
+		try {
+			response = await Promise.race([
+				fetch(request, init),
+				new Promise<Response>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000)),
+			]);
+		} catch (error: any) {
+			if (error.message === 'Timeout' || error.message === 'Network request failed') {
+				throw new NetworkError();
+			} else {
+				throw error; // rethrow other unexpected errors
+			}
+		}
+		if (!response.ok) {
+			const text = await response.text();
+			throw new ServerError(response.status, text);
+		}
+		try {
+			const body = await response.json();
+			return body;
+		} catch (e) {
+			throw new NetworkError();
+		}
+	}
+}
+
+class NetworkError extends Error {
+	constructor() {
+		super('Network failure');
+	}
+}
+
+class ServerError extends Error {
+	constructor(readonly status: number, readonly reason: string) {
+		super('Server failure');
+	}
 }

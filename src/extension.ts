@@ -1,19 +1,19 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
-import { defaultScopes, SpotifyAuthProvider, UpdateableAuthenticationSession } from './authProvider';
+import { SpotifyAuthProvider } from './authProvider';
 import { SpotifyUriHandler } from './uriHandler';
 import { SpotifyChatResponseHandler } from './chatParticipant';
-import { BetterTokenStorage } from './betterSecretStorage';
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
 
 	const uriHandler = new SpotifyUriHandler();
 	context.subscriptions.push(uriHandler);
-	const tokenStorage = new BetterTokenStorage<UpdateableAuthenticationSession>(context.extension.id, context);
-	const authProvider = new SpotifyAuthProvider(uriHandler, tokenStorage);
+	const authProvider = new SpotifyAuthProvider(uriHandler, context.secrets);
+	await authProvider.initialize();
+	context.subscriptions.push(authProvider);
 	context.subscriptions.push(vscode.window.registerUriHandler(uriHandler));
 	context.subscriptions.push(vscode.authentication.registerAuthenticationProvider(
 		SpotifyAuthProvider.id,

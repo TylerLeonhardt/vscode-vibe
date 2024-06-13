@@ -1,7 +1,7 @@
+import { AccessToken, SpotifyApi } from "@spotify/web-api-ts-sdk";
+import * as crypto from 'crypto';
 import { authentication, AuthenticationProvider, AuthenticationProviderAuthenticationSessionsChangeEvent, AuthenticationSession, Disposable, env, Event, EventEmitter, SecretStorage, Uri, window } from "vscode";
 import { SpotifyUriHandler } from "./uriHandler";
-import * as crypto from 'crypto';
-import { AccessToken, SpotifyApi } from "@spotify/web-api-ts-sdk";
 
 const clientId = '18f4898a018949518ac1b17eea561af9';
 const redirectUrl = 'https://vscode.dev/redirect';
@@ -24,18 +24,18 @@ export class SpotifyAuthProvider extends Disposable implements AuthenticationPro
 	static readonly label = 'Spotify';
 
 	private _disposables = new Set<Disposable>();
+	private _uriHandler = new SpotifyUriHandler();
 
 	private _onDidChangeSessions: EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent> = new EventEmitter<AuthenticationProviderAuthenticationSessionsChangeEvent>();
 	onDidChangeSessions: Event<AuthenticationProviderAuthenticationSessionsChangeEvent> = this._onDidChangeSessions.event;
 
-	// TODO: Save these sessions to disk
 	private _sessions: UpdateableAuthenticationSession[] = [];
 
-	constructor(
-		private readonly _uriHandler: SpotifyUriHandler,
-		private readonly _secretStorage: SecretStorage
-	) {
+	constructor(private readonly _secretStorage: SecretStorage) {
 		super(() => this.dispose());
+		this._disposables.add(this._uriHandler);
+		this._disposables.add(window.registerUriHandler(this._uriHandler));
+		this._disposables.add(this._onDidChangeSessions);
 	}
 
 	dispose() {
